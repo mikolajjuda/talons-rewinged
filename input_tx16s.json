@@ -1,0 +1,69 @@
+{
+    "yaw": {
+        "pad": "OpenTX RM TX16S Joystick",
+        "axis": "RightStickX",
+        "neg": null,
+        "pos": null,
+        "raw": [
+            -1.0,
+            1.0
+        ],
+        "out": [
+            -1.0,
+            1.0
+        ],
+        "deadzone": 0.0
+    },
+    "throttle": {
+        "pad": "OpenTX RM TX16S Joystick",
+        "axis": "LeftZ",
+        "neg": null,
+        "pos": null,
+        "raw": [
+            -1.0,
+            1.0
+        ],
+        "out": [
+            0.0,
+            1.0
+        ],
+        "deadzone": 0.0
+    },
+    "roll": {
+        "pad": "OpenTX RM TX16S Joystick",
+        "axis": "LeftStickX",
+        "neg": null,
+        "pos": null,
+        "raw": [
+            -1.0,
+            1.0
+        ],
+        "out": [
+            -1.0,
+            1.0
+        ],
+        "deadzone": 0.0
+    },
+    "pitch": {
+        "pad": "OpenTX RM TX16S Joystick",
+        "axis": "LeftStickY",
+        "neg": null,
+        "pos": null,
+        "raw": [
+            -1.0,
+            1.0
+        ],
+        "out": [
+            1.0,
+            -1.0
+        ],
+        "deadzone": 0.0
+    },
+    "switch": {
+        "pad": "OpenTX RM TX16S Joystick",
+        "button": "North",
+        "axis": null,
+        "threshold": 0.25,
+        "invert": false
+    }
+}
