@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 use tinyaudio::{OutputDevice, OutputDeviceParameters, run_output_device};
 
-const SAMPLE_RATE: usize = 44100;
+const SAMPLE_RATE: usize = 48000;
 const CHANNELS: usize = 2;
-const BUFFER_FRAMES: usize = 512;
+const BUFFER_FRAMES: usize = 4096;
 const PIT_CLOCK_HZ: f32 = 1_193_182.0;
 
 const TEMPLE_TEMPO: f32 = 2.5;
@@ -95,6 +95,8 @@ impl SynthState {
 
 pub struct AudioSystem {
     state: Arc<Mutex<SynthState>>,
+    music_enabled: bool,
+    muted: bool,
     _device: Option<OutputDevice>,
 }
 
@@ -131,11 +133,17 @@ impl AudioSystem {
 
         Self {
             state,
+            music_enabled: false,
+            muted: false,
             _device: device,
         }
     }
 
     pub fn ensure_music_playing(&mut self) {
+        if self.muted || self.music_enabled {
+            return;
+        }
+        self.music_enabled = true;
         if let Ok(mut synth) = self.state.lock() {
             if !synth.muted && !synth.music_enabled {
                 synth.note_idx = 0;
@@ -146,6 +154,10 @@ impl AudioSystem {
     }
 
     pub fn stop_music(&mut self) {
+        if !self.music_enabled {
+            return;
+        }
+        self.music_enabled = false;
         if let Ok(mut synth) = self.state.lock() {
             synth.music_enabled = false;
             synth.note_idx = 0;
@@ -154,8 +166,12 @@ impl AudioSystem {
     }
 
     pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        if self.muted {
+            self.music_enabled = false;
+        }
         if let Ok(mut synth) = self.state.lock() {
-            synth.muted = !synth.muted;
+            synth.muted = self.muted;
             if synth.muted {
                 synth.music_enabled = false;
             }
@@ -163,6 +179,9 @@ impl AudioSystem {
     }
 
     pub fn play_catch(&self) {
+        if self.muted {
+            return;
+        }
         if let Ok(mut synth) = self.state.lock() {
             if !synth.muted {
                 synth.sfx_freq = pit_quantize_freq(ona_to_freq(74));
@@ -173,6 +192,9 @@ impl AudioSystem {
     }
 
     pub fn play_crash(&self) {
+        if self.muted {
+            return;
+        }
         if let Ok(mut synth) = self.state.lock() {
             if !synth.muted {
                 synth.sfx_freq = pit_quantize_freq(ona_to_freq(62));
