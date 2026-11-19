@@ -14,6 +14,8 @@ const SPRITE_LIGHT_DIRECTION: Vec3 = Vec3::new(-0.4, 0.8, -0.5);
 
 pub struct RenderAssets {
     pub sprites: HashMap<u32, RenderSprite>,
+    /// Single static mesh where vertex.position = BI=2 (up) and vertex.normal.xyz = BI=3 (down)
+    pub morph_bird_meshes: Vec<Mesh>,
 }
 
 pub struct RenderSprite {
@@ -42,12 +44,22 @@ impl RenderAssets {
         let parsed = crate::sprites_parser::parse_talons(include_bytes!("../../assets/Talons.HC"))
             .expect("Failed to parse embedded Talons.HC");
 
-        let sprites = parsed
+        let sprites: HashMap<u32, RenderSprite> = parsed
             .into_iter()
             .map(|(bi, sprite)| (bi, RenderSprite::from_sprite(&sprite)))
             .collect();
 
-        Self { sprites }
+        // Build continuous morph target mesh: BI=2 (glide/up) -> BI=3 (flap/down)
+        let morph_bird_meshes = if let (Some(a), Some(b)) = (sprites.get(&2), sprites.get(&3)) {
+            build_morph_meshes(a, b)
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            sprites,
+            morph_bird_meshes,
+        }
     }
 
     pub fn get(&self, bi: u32) -> &RenderSprite {
@@ -251,6 +263,34 @@ fn make_mesh(
         indices,
         texture: None,
     }
+}
+
+fn build_morph_meshes(a: &RenderSprite, b: &RenderSprite) -> Vec<Mesh> {
+    let mut out = Vec::new();
+    for (ma, mb) in a.meshes.iter().zip(&b.meshes) {
+        if ma.vertices.len() != mb.vertices.len() || ma.indices != mb.indices {
+            continue;
+        }
+
+        // Store base frame position in `position`, and target frame position in `normal.xyz`
+        let vertices = ma
+            .vertices
+            .iter()
+            .zip(&mb.vertices)
+            .map(|(va, vb)| {
+                let mut v = *va;
+                v.normal = vec4(vb.position.x, vb.position.y, vb.position.z, 0.0);
+                v
+            })
+            .collect();
+
+        out.push(Mesh {
+            vertices,
+            indices: ma.indices.clone(),
+            texture: None,
+        });
+    }
+    out
 }
 
 fn sprite_position(vertex: (i32, i32, i32), offset: (i32, i32, i32)) -> Vec3 {

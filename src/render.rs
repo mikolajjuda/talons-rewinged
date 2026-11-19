@@ -18,20 +18,67 @@ const TREE_MAX_DIST_SQ: f32 = 380.0 * 380.0;
 const BOAT_MAX_DIST_SQ: f32 = 500.0 * 500.0;
 const BIRD_MAX_DIST_SQ: f32 = 500.0 * 500.0;
 const FISH_MAX_DIST_SQ: f32 = 350.0 * 350.0;
+const TERRAIN_MAX_DIST_SQ: f32 = 750.0 * 750.0;
+
+const BIRD_VERTEX_SHADER: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+attribute vec4 normal;
+
+varying lowp vec4 color;
+
+uniform mat4 Model;
+uniform mat4 Projection;
+uniform float flap_t;
+
+void main() {
+    vec3 animated_pos = mix(position, normal.xyz, flap_t);
+    gl_Position = Projection * Model * vec4(animated_pos, 1.0);
+    color = color0 / 255.0;
+}
+"#;
+
+const BIRD_FRAGMENT_SHADER: &str = r#"#version 100
+varying lowp vec4 color;
+
+void main() {
+    gl_FragColor = color;
+}
+"#;
 
 pub struct Renderer {
     terrain_chunks: Vec<TerrainChunk>,
     water_mesh: Mesh,
     assets: RenderAssets,
+    bird_material: Material,
     world_seed: u64,
 }
 
 impl Renderer {
     pub fn new(world: &World) -> Self {
+        let bird_material = load_material(
+            ShaderSource::Glsl {
+                vertex: BIRD_VERTEX_SHADER,
+                fragment: BIRD_FRAGMENT_SHADER,
+            },
+            MaterialParams {
+                uniforms: vec![UniformDesc::new("flap_t", UniformType::Float1)],
+                pipeline_params: PipelineParams {
+                    depth_write: true,
+                    depth_test: Comparison::LessOrEqual,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("Failed to compile bird morph material");
+
         Self {
             terrain_chunks: build_terrain_chunks(world),
             water_mesh: build_water_mesh(world),
             assets: RenderAssets::new(),
+            bird_material,
             world_seed: world.seed,
         }
     }
@@ -68,7 +115,9 @@ impl Renderer {
 
         for chunk in &self.terrain_chunks {
             let to_chunk = chunk.center - bird.pos;
-            if to_chunk.dot(forward) < -chunk.radius {
+            let dist_sq = to_chunk.length_squared();
+            let max_reach = TERRAIN_MAX_DIST_SQ + chunk.radius * chunk.radius;
+            if dist_sq > max_reach || to_chunk.dot(forward) < -chunk.radius {
                 continue;
             }
             draw_mesh(&chunk.mesh);
@@ -143,6 +192,7 @@ impl Renderer {
             }
         }
 
+        // Continuous triangle wave flap animation directly in vertex shader
         let phase = (get_time() as f32 / 0.2).fract();
         let flap_t = if phase < 0.5 {
             phase * 2.0
@@ -150,26 +200,31 @@ impl Renderer {
             (1.0 - phase) * 2.0
         };
 
-        let bird_a = self.assets.get(2);
-        let bird_b = self.assets.get(3);
-        let interpolated_meshes = build_interpolated_meshes(bird_a, bird_b, flap_t);
+        if !self.assets.morph_bird_meshes.is_empty() {
+            gl_use_material(&self.bird_material);
+            self.bird_material.set_uniform("flap_t", flap_t);
 
-        for other_bird in &world.birds {
-            let delta = other_bird.pos - bird.pos;
-            if delta.length_squared() > BIRD_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
-                continue;
+            for other_bird in &world.birds {
+                let delta = other_bird.pos - bird.pos;
+                if delta.length_squared() > BIRD_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
+                    continue;
+                }
+
+                draw_meshes_transformed(
+                    &self.assets.morph_bird_meshes,
+                    other_bird.pos,
+                    other_bird.angle,
+                    1.0,
+                );
             }
 
-            let mut drew = false;
-            if let Some(ref meshes) = interpolated_meshes {
-                draw_meshes_transformed(meshes, other_bird.pos, other_bird.angle, 1.0);
-                drew = true;
-            } else if !bird_a.meshes.is_empty() {
-                draw_meshes_transformed(&bird_a.meshes, other_bird.pos, other_bird.angle, 1.0);
-                drew = true;
-            }
-
-            if !drew {
+            gl_use_default_material();
+        } else {
+            for other_bird in &world.birds {
+                let delta = other_bird.pos - bird.pos;
+                if delta.length_squared() > BIRD_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
+                    continue;
+                }
                 let wing = vec3(-other_bird.angle.sin(), 0.0, other_bird.angle.cos()) * 1.5;
                 draw_line_3d(other_bird.pos - wing, other_bird.pos + wing, COLOR_WHITE);
             }
@@ -236,10 +291,11 @@ fn draw_hud(state: &GameState) {
 
     let ground = state.world.get_height(bird.pos.x, bird.pos.z);
     let height = (bird.pos.y - ground).round() as i32;
+    let speed = bird.speed();
 
     let line1 = format!(
-        "Pitch:{:5.1} Roll:{:5.1} Heading:{:5.1} Height:{:5}",
-        pitch_deg, roll_deg, heading_deg, height
+        "Pitch:{:5.1} Roll:{:5.1} Heading:{:5.1} Height:{:5} Speed:{:5.1}",
+        pitch_deg, roll_deg, heading_deg, height, speed
     );
     let line2 = format!(
         "Fish Remaining:{} Time:{:3.2} Best:{:3.2}",
@@ -304,37 +360,4 @@ fn draw_lines_3d_fast(lines: &[SpriteLine], pos: Vec3, scale: f32, cam_right: Ve
         let p2 = pos + cam_right * (line.x2 as f32 * s) - cam_up * (line.y2 as f32 * s);
         draw_line_3d(p1, p2, line.color);
     }
-}
-
-fn build_interpolated_meshes(a: &RenderSprite, b: &RenderSprite, t: f32) -> Option<Vec<Mesh>> {
-    if a.meshes.is_empty() || a.meshes.len() != b.meshes.len() {
-        return None;
-    }
-
-    let mut out = Vec::with_capacity(a.meshes.len());
-
-    for (ma, mb) in a.meshes.iter().zip(&b.meshes) {
-        if ma.vertices.len() != mb.vertices.len() || ma.indices != mb.indices {
-            return None;
-        }
-
-        let vertices = ma
-            .vertices
-            .iter()
-            .zip(&mb.vertices)
-            .map(|(va, vb)| {
-                let mut v = *va;
-                v.position = va.position.lerp(vb.position, t);
-                v
-            })
-            .collect();
-
-        out.push(Mesh {
-            vertices,
-            indices: ma.indices.clone(),
-            texture: ma.texture.clone(),
-        });
-    }
-
-    Some(out)
 }

@@ -1,11 +1,13 @@
-use crate::flight::{BirdState, ClassicModel, FlightModel, RealisticModel};
+use crate::flight::{BirdState, ClassicModel, DroneAcroModel, FlightModel, PhysicsModel};
 use crate::input::GameInputs;
 use crate::world::{MAP_SCALE, WATER_ELEVATION, World};
 use macroquad::prelude::*;
 
 const SPAWN_CLEARANCE: f32 = 40.0;
 const CATCH_RADIUS: f32 = 8.0;
+const CATCH_RADIUS_SQ: f32 = CATCH_RADIUS * CATCH_RADIUS;
 pub const TARGET_FISH: u32 = 10;
+pub const LOCKED_BEST_TIME: f32 = 9999.0;
 
 pub struct GameState {
     pub world: World,
@@ -41,14 +43,14 @@ impl GameState {
             won: false,
             score: 0,
             elapsed: 0.0,
-            best_time: 9999.0,
+            best_time: LOCKED_BEST_TIME,
         }
     }
 
     pub fn new_physics() -> Self {
         let world = World::new(1337);
         let spawn = Self::spawn_pos(&world);
-        let mut model = Box::new(RealisticModel::new(spawn));
+        let mut model = Box::new(PhysicsModel::new(spawn));
         model.reset(spawn);
         let bird = *model.state();
 
@@ -60,7 +62,26 @@ impl GameState {
             won: false,
             score: 0,
             elapsed: 0.0,
-            best_time: 9999.0,
+            best_time: LOCKED_BEST_TIME,
+        }
+    }
+
+    pub fn new_drone() -> Self {
+        let world = World::new(1337);
+        let spawn = Self::spawn_pos(&world);
+        let mut model = Box::new(DroneAcroModel::new(spawn));
+        model.reset(spawn);
+        let bird = *model.state();
+
+        Self {
+            world,
+            bird,
+            flight_model: model,
+            alive: true,
+            won: false,
+            score: 0,
+            elapsed: 0.0,
+            best_time: LOCKED_BEST_TIME,
         }
     }
 
@@ -73,6 +94,7 @@ impl GameState {
         self.won = false;
         self.score = 0;
         self.elapsed = 0.0;
+        self.best_time = LOCKED_BEST_TIME;
     }
 
     pub fn fish_remaining(&self) -> u32 {
@@ -96,11 +118,12 @@ impl GameState {
 
         if self.bird.catch_armed {
             for fish in &mut self.world.fishes {
-                if !fish.caught && self.bird.pos.distance(fish.pos) < CATCH_RADIUS {
+                if !fish.caught && self.bird.pos.distance_squared(fish.pos) < CATCH_RADIUS_SQ {
                     fish.caught = true;
                     self.score += 1;
                     if self.score >= TARGET_FISH {
                         self.won = true;
+                        // best_time is deliberately kept locked at 9999.0
                         break;
                     }
                 }

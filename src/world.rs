@@ -101,17 +101,19 @@ impl World {
 
         let half_w = (MAP_WIDTH as f32 * 0.5) * WORLD_SPACING;
         let half_h = (MAP_HEIGHT as f32 * 0.5) * WORLD_SPACING;
+        let inv_spacing = 1.0 / WORLD_SPACING;
+        let inv_map_scale = 1.0 / (MAP_SCALE as f32);
+        let max_gx = (MAP_WIDTH - 1) as f32;
+        let max_gy = (MAP_HEIGHT - 1) as f32;
 
         for bird in &mut self.birds {
             bird.pos.x += BIRD_SPEED * dt * bird.angle.cos();
             bird.pos.z += BIRD_SPEED * dt * bird.angle.sin();
             bird.angle = (bird.angle + BIRD_TURN_RATE * dt).rem_euclid(std::f32::consts::TAU);
 
-            let gx =
-                ((bird.pos.x + half_w) / WORLD_SPACING).clamp(0.0, (MAP_WIDTH - 1) as f32) as usize;
-            let gy = ((bird.pos.z + half_h) / WORLD_SPACING).clamp(0.0, (MAP_HEIGHT - 1) as f32)
-                as usize;
-            let ground_h = self.elevations[gy * MAP_WIDTH + gx] as f32 / MAP_SCALE as f32;
+            let gx = ((bird.pos.x + half_w) * inv_spacing).clamp(0.0, max_gx) as usize;
+            let gy = ((bird.pos.z + half_h) * inv_spacing).clamp(0.0, max_gy) as usize;
+            let ground_h = (self.elevations[gy * MAP_WIDTH + gx] as f32) * inv_map_scale;
 
             bird.pos.y = BIRD_ELEVATION + ground_h;
         }

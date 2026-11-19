@@ -249,12 +249,13 @@ impl InputSystem {
             }
         }
 
+        let def = InputConfig::default();
         GameInputs {
-            yaw: self.eval_axis(&self.cfg.yaw, false),
-            throttle: self.eval_axis(&self.cfg.throttle, true),
-            roll: self.eval_axis(&self.cfg.roll, false),
-            pitch: self.eval_axis(&self.cfg.pitch, false),
-            switch: self.eval_switch(&self.cfg.switch),
+            yaw: self.eval_axis(&self.cfg.yaw, &def.yaw, false),
+            throttle: self.eval_axis(&self.cfg.throttle, &def.throttle, true),
+            roll: self.eval_axis(&self.cfg.roll, &def.roll, false),
+            pitch: self.eval_axis(&self.cfg.pitch, &def.pitch, false),
+            switch: self.eval_switch(&self.cfg.switch, &def.switch),
         }
     }
 
@@ -295,53 +296,90 @@ impl InputSystem {
         v
     }
 
-    fn eval_axis(&self, b: &AxisBinding, unipolar: bool) -> f32 {
+    fn eval_binding_on_dev(
+        &self,
+        b: &AxisBinding,
+        dev: &DeviceState,
+        unipolar: bool,
+    ) -> Option<f32> {
+        let neg = b
+            .neg
+            .as_ref()
+            .and_then(|k| dev.buttons.get(k))
+            .copied()
+            .unwrap_or(false);
+        let pos = b
+            .pos
+            .as_ref()
+            .and_then(|k| dev.buttons.get(k))
+            .copied()
+            .unwrap_or(false);
+
+        if neg || pos {
+            let val = match (neg, pos) {
+                (true, false) => b.raw[0],
+                (false, true) => b.raw[1],
+                _ => {
+                    if unipolar {
+                        b.raw[0]
+                    } else {
+                        (b.raw[0] + b.raw[1]) * 0.5
+                    }
+                }
+            };
+            Some(Self::remap(val, b.raw, b.out, b.deadzone, unipolar))
+        } else {
+            None
+        }
+    }
+
+    fn eval_axis(&self, b: &AxisBinding, default_b: &AxisBinding, unipolar: bool) -> f32 {
+        // 1. Keyboard button presses ALWAYS override controller axes:
+        // Check active binding buttons on keyboard
+        if let Some(val) = self.eval_binding_on_dev(b, &self.keyboard, unipolar) {
+            return val;
+        }
+        // Check default keyboard buttons on keyboard (seamless fallback if controller disconnected)
+        if let Some(val) = self.eval_binding_on_dev(default_b, &self.keyboard, unipolar) {
+            return val;
+        }
+
+        // 2. If no keyboard button is pressed, read matching device (gamepad controller)
         for dev in self.matching_devices(&b.pad) {
             if let Some(id) = &b.axis {
                 if let Some(&raw_val) = dev.axes.get(id) {
                     return Self::remap(raw_val, b.raw, b.out, b.deadzone, unipolar);
                 }
             }
-            let neg = b
-                .neg
-                .as_ref()
-                .and_then(|k| dev.buttons.get(k))
-                .copied()
-                .unwrap_or(false);
-            let pos = b
-                .pos
-                .as_ref()
-                .and_then(|k| dev.buttons.get(k))
-                .copied()
-                .unwrap_or(false);
-            if b.neg.is_some() || b.pos.is_some() {
-                let val = match (neg, pos) {
-                    (true, false) => b.raw[0],
-                    (false, true) => b.raw[1],
-                    _ => {
-                        if unipolar {
-                            b.raw[0]
-                        } else if b.neg.is_none() && b.pos.is_some() {
-                            b.raw[0]
-                        } else if b.pos.is_none() && b.neg.is_some() {
-                            b.raw[1]
-                        } else {
-                            (b.raw[0] + b.raw[1]) * 0.5
-                        }
-                    }
-                };
-                return Self::remap(val, b.raw, b.out, b.deadzone, unipolar);
+            if let Some(val) = self.eval_binding_on_dev(b, dev, unipolar) {
+                return val;
             }
         }
+
         0.0
     }
 
-    fn eval_switch(&self, b: &SwitchBinding) -> bool {
+    fn eval_switch(&self, b: &SwitchBinding, default_b: &SwitchBinding) -> bool {
+        // 1. Check keyboard first (configured button on keyboard OR default Space on keyboard)
+        if let Some(btn) = &b.button {
+            if self.keyboard.buttons.get(btn).copied().unwrap_or(false) {
+                return if b.invert { false } else { true };
+            }
+        }
+        if let Some(btn) = &default_b.button {
+            if self.keyboard.buttons.get(btn).copied().unwrap_or(false) {
+                return true;
+            }
+        }
+
+        // 2. Check matching device (gamepad controller)
         for dev in self.matching_devices(&b.pad) {
-            if let Some(btn) = &b.button {
-                if let Some(&pressed) = dev.buttons.get(btn) {
-                    if if b.invert { !pressed } else { pressed } {
-                        return true;
+            if dev.name != "Keyboard" {
+                if let Some(btn) = &b.button {
+                    if let Some(&pressed) = dev.buttons.get(btn) {
+                        if if b.invert { !pressed } else { pressed } {
+                            return true;
+                        }
                     }
                 }
             }
@@ -354,6 +392,7 @@ impl InputSystem {
                 }
             }
         }
+
         false
     }
 }

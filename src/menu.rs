@@ -66,26 +66,31 @@ fn draw_axis_meter(x: f32, y: f32, w: f32, h: f32, val: f32, unipolar: bool) {
 
 pub fn draw_main_menu(screen: &mut Screen) {
     let panel_w = 340.0;
-    let panel_h = 240.0;
+    let panel_h = 280.0; // Increased height for the 4th button
     let px = (screen_width() - panel_w) * 0.5;
-    let py = (screen_height() - panel_h) * 0.38;
+    let py = (screen_height() - panel_h) * 0.35;
 
     draw_rectangle(px, py, panel_w, panel_h, PANEL_BG);
     draw_rectangle_lines(px, py, panel_w, panel_h, 3.0, PANEL_BORDER);
 
-    draw_text("Talons Rewinged", px + 48.0, py + 42.0, 32.0, DARK_GREEN);
+    draw_text("Talons Rewinged", px + 48.0, py + 38.0, 32.0, DARK_GREEN);
 
-    let btn_classic = Rect::new(px + 60.0, py + 68.0, 220.0, 38.0);
+    let btn_classic = Rect::new(px + 60.0, py + 58.0, 220.0, 36.0);
     if draw_button(btn_classic, "Classic Game", false) || is_key_pressed(KeyCode::C) {
         *screen = Screen::Game(GameState::new_classic());
     }
 
-    let btn_physics = Rect::new(px + 60.0, py + 118.0, 220.0, 38.0);
-    if draw_button(btn_physics, "Physics Game", false) || is_key_pressed(KeyCode::P) {
+    let btn_physics = Rect::new(px + 60.0, py + 104.0, 220.0, 36.0);
+    if draw_button(btn_physics, "Bird Physics", false) || is_key_pressed(KeyCode::P) {
         *screen = Screen::Game(GameState::new_physics());
     }
 
-    let btn_input = Rect::new(px + 60.0, py + 168.0, 220.0, 38.0);
+    let btn_drone = Rect::new(px + 60.0, py + 150.0, 220.0, 36.0);
+    if draw_button(btn_drone, "Drone Acro (FPV)", false) || is_key_pressed(KeyCode::O) {
+        *screen = Screen::Game(GameState::new_drone());
+    }
+
+    let btn_input = Rect::new(px + 60.0, py + 196.0, 220.0, 36.0);
     if draw_button(btn_input, "Input Test", false) || is_key_pressed(KeyCode::I) {
         *screen = Screen::InputTest;
     }

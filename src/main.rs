@@ -80,29 +80,63 @@ async fn main() {
                     renderer.draw(state);
 
                     if !state.alive || state.won {
-                        let cx = screen_width() * 0.5 - 160.0;
-                        let cy = screen_height() * 0.5 - 30.0;
+                        let box_w = 380.0;
+                        let box_h = if state.won { 108.0 } else { 82.0 };
+                        let cx = (screen_width() - box_w) * 0.5;
+                        let cy = (screen_height() - box_h) * 0.45;
+
                         let (bg, title) = if state.won {
-                            (Color::new(0.15, 0.65, 0.25, 0.9), "ALL 10 FISH CAUGHT!")
+                            (Color::new(0.12, 0.60, 0.22, 0.94), "ALL 10 FISH CAUGHT!")
                         } else {
-                            (Color::new(0.85, 0.15, 0.15, 0.9), "CRASHED!")
+                            (Color::new(0.85, 0.15, 0.15, 0.94), "CRASHED!")
                         };
-                        let dims = measure_text(title, None, 30, 1.0);
-                        draw_rectangle(cx - 20.0, cy - 26.0, 360.0, 80.0, bg);
+
+                        draw_rectangle(cx, cy, box_w, box_h, bg);
+                        draw_rectangle_lines(cx, cy, box_w, box_h, 2.0, WHITE);
+
+                        let title_dim = measure_text(title, None, 28, 1.0);
                         draw_text(
                             title,
-                            cx - 20.0 + (360.0 - dims.width) * 0.5,
-                            cy + 10.0,
-                            30.0,
+                            cx + (box_w - title_dim.width) * 0.5,
+                            cy + 30.0,
+                            28.0,
                             WHITE,
                         );
-                        draw_text(
-                            "[Enter] Restart   [Esc] Menu",
-                            cx + 30.0,
-                            cy + 40.0,
-                            18.0,
-                            WHITE,
-                        );
+
+                        if state.won {
+                            let time_msg = format!(
+                                "Time: {:.2}s  (Best: {:.2}s)",
+                                state.elapsed, state.best_time
+                            );
+                            let time_dim = measure_text(&time_msg, None, 18, 1.0);
+                            draw_text(
+                                &time_msg,
+                                cx + (box_w - time_dim.width) * 0.5,
+                                cy + 60.0,
+                                18.0,
+                                YELLOW,
+                            );
+
+                            let sub_msg = "[Enter] Restart   [Esc] Menu";
+                            let sub_dim = measure_text(sub_msg, None, 16, 1.0);
+                            draw_text(
+                                sub_msg,
+                                cx + (box_w - sub_dim.width) * 0.5,
+                                cy + 90.0,
+                                16.0,
+                                WHITE,
+                            );
+                        } else {
+                            let sub_msg = "[Enter] Restart   [Esc] Menu";
+                            let sub_dim = measure_text(sub_msg, None, 16, 1.0);
+                            draw_text(
+                                sub_msg,
+                                cx + (box_w - sub_dim.width) * 0.5,
+                                cy + 62.0,
+                                16.0,
+                                WHITE,
+                            );
+                        }
                     }
                 }
             }
