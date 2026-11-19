@@ -1,49 +1,65 @@
-use crate::flight::BirdState;
-use crate::world::{
-    Fish, MAP_HEIGHT, MAP_SCALE, MAP_WIDTH, MESH_SIZE, ROCK_ELEVATION, SNOW_ELEVATION,
-    WATER_ELEVATION, WORLD_SPACING, WORLD_STEP, World,
-};
-use macroquad::models::{Mesh, Vertex, draw_mesh, draw_sphere};
+mod assets;
+mod claws;
+mod palette;
+mod terrain;
+
+use crate::game::GameState;
+use crate::world::World;
+use macroquad::models::{Mesh, draw_mesh, draw_sphere};
 use macroquad::prelude::*;
 
-const CHUNK_QUADS: usize = 16;
+use self::assets::{RenderAssets, RenderSprite, SPRITE_SCALE, SpriteLine};
+use self::palette::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
+use self::terrain::{TerrainChunk, build_terrain_chunks, build_water_mesh};
 
-const COLOR_BLUE: Color = Color::new(0.0, 0.0, 0.667, 1.0);
-const COLOR_GREEN: Color = Color::new(0.0, 0.667, 0.0, 1.0);
-const COLOR_LTGREEN: Color = Color::new(0.333, 1.0, 0.333, 1.0);
-const COLOR_DKGRAY: Color = Color::new(0.333, 0.333, 0.333, 1.0);
-const COLOR_LTGRAY: Color = Color::new(0.667, 0.667, 0.667, 1.0);
-const COLOR_WHITE: Color = Color::new(1.0, 1.0, 1.0, 1.0);
-const COLOR_RED: Color = Color::new(1.0, 0.0, 0.0, 1.0);
-const COLOR_BLACK: Color = Color::new(0.0, 0.0, 0.0, 1.0);
+const LANDSCAPE_SCALE: f32 = 2.0;
+
+const TREE_MAX_DIST_SQ: f32 = 380.0 * 380.0;
+const BOAT_MAX_DIST_SQ: f32 = 500.0 * 500.0;
+const BIRD_MAX_DIST_SQ: f32 = 500.0 * 500.0;
+const FISH_MAX_DIST_SQ: f32 = 350.0 * 350.0;
 
 pub struct Renderer {
-    terrain_chunks: Vec<Mesh>,
+    terrain_chunks: Vec<TerrainChunk>,
     water_mesh: Mesh,
+    assets: RenderAssets,
     world_seed: u64,
 }
 
 impl Renderer {
     pub fn new(world: &World) -> Self {
         Self {
-            terrain_chunks: Self::build_terrain_chunks(world),
-            water_mesh: Self::build_water_mesh(world),
+            terrain_chunks: build_terrain_chunks(world),
+            water_mesh: build_water_mesh(world),
+            assets: RenderAssets::new(),
             world_seed: world.seed,
         }
     }
 
-    pub fn draw(&mut self, world: &World, bird: &BirdState) {
+    pub fn draw(&mut self, state: &GameState) {
+        let world = &state.world;
+        let bird = &state.bird;
+
         if world.seed != self.world_seed {
-            self.terrain_chunks = Self::build_terrain_chunks(world);
-            self.water_mesh = Self::build_water_mesh(world);
+            self.terrain_chunks = build_terrain_chunks(world);
+            self.water_mesh = build_water_mesh(world);
             self.world_seed = world.seed;
         }
 
+        let forward = bird.forward();
+        let cam_right = bird.right();
+        let cam_up = bird.up();
+
+        let w = screen_width();
+        let h = screen_height();
+        let aspect = w / h.max(1.0);
+        let fovy = calculate_dynamic_fovy(aspect);
+
         let camera = Camera3D {
             position: bird.pos,
-            target: bird.pos + bird.forward() * 50.0,
-            up: bird.up(),
-            fovy: 75.0f32.to_radians(),
+            target: bird.pos + forward * 50.0,
+            up: cam_up,
+            fovy,
             projection: Projection::Perspective,
             ..Default::default()
         };
@@ -51,160 +67,274 @@ impl Renderer {
         set_camera(&camera);
 
         for chunk in &self.terrain_chunks {
-            draw_mesh(chunk);
+            let to_chunk = chunk.center - bird.pos;
+            if to_chunk.dot(forward) < -chunk.radius {
+                continue;
+            }
+            draw_mesh(&chunk.mesh);
         }
 
         draw_mesh(&self.water_mesh);
 
+        let fish_sprite = self.assets.get(1);
         for fish in &world.fishes {
-            if !fish.caught {
+            if fish.caught {
+                continue;
+            }
+            let delta = fish.pos - bird.pos;
+            if delta.length_squared() > FISH_MAX_DIST_SQ || delta.dot(forward) < -10.0 {
+                continue;
+            }
+
+            if !self.draw_sprite_fast(1, fish_sprite, fish.pos, 0.0, 1.0, cam_right, cam_up) {
                 draw_sphere(fish.pos, 2.0, None, COLOR_RED);
                 let tail_dir = vec3(fish.angle.cos(), 0.0, fish.angle.sin()) * 3.0;
                 draw_line_3d(fish.pos, fish.pos - tail_dir, COLOR_WHITE);
             }
         }
 
+        for boat in &world.boats {
+            let delta = boat.pos - bird.pos;
+            if delta.length_squared() > BOAT_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
+                continue;
+            }
+
+            let sprite = self.assets.get(boat.sprite_id);
+            if !self.draw_sprite_fast(
+                boat.sprite_id,
+                sprite,
+                boat.pos,
+                0.0,
+                LANDSCAPE_SCALE,
+                cam_right,
+                cam_up,
+            ) {
+                draw_cube(boat.pos, vec3(4.0, 2.0, 2.0), None, COLOR_WHITE);
+            }
+        }
+
+        let tree_sprite = self.assets.get(6);
+        for tree in &world.trees {
+            let delta = tree.pos - bird.pos;
+            if delta.length_squared() > TREE_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
+                continue;
+            }
+
+            if !self.draw_sprite_fast(
+                6,
+                tree_sprite,
+                tree.pos,
+                0.0,
+                LANDSCAPE_SCALE,
+                cam_right,
+                cam_up,
+            ) {
+                draw_line_3d(
+                    tree.pos,
+                    tree.pos + vec3(0.0, 2.0, 0.0),
+                    Color::new(0.45, 0.25, 0.1, 1.0),
+                );
+                draw_sphere(
+                    tree.pos + vec3(0.0, 3.0, 0.0),
+                    1.5,
+                    None,
+                    Color::new(0.0, 0.65, 0.0, 1.0),
+                );
+            }
+        }
+
+        let phase = (get_time() as f32 / 0.2).fract();
+        let flap_t = if phase < 0.5 {
+            phase * 2.0
+        } else {
+            (1.0 - phase) * 2.0
+        };
+
+        let bird_a = self.assets.get(2);
+        let bird_b = self.assets.get(3);
+        let interpolated_meshes = build_interpolated_meshes(bird_a, bird_b, flap_t);
+
+        for other_bird in &world.birds {
+            let delta = other_bird.pos - bird.pos;
+            if delta.length_squared() > BIRD_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
+                continue;
+            }
+
+            let mut drew = false;
+            if let Some(ref meshes) = interpolated_meshes {
+                draw_meshes_transformed(meshes, other_bird.pos, other_bird.angle, 1.0);
+                drew = true;
+            } else if !bird_a.meshes.is_empty() {
+                draw_meshes_transformed(&bird_a.meshes, other_bird.pos, other_bird.angle, 1.0);
+                drew = true;
+            }
+
+            if !drew {
+                let wing = vec3(-other_bird.angle.sin(), 0.0, other_bird.angle.cos()) * 1.5;
+                draw_line_3d(other_bird.pos - wing, other_bird.pos + wing, COLOR_WHITE);
+            }
+        }
+
         set_default_camera();
+
+        claws::draw_claws(&self.assets, bird.claws_down);
 
         let cx = screen_width() * 0.5;
         let cy = screen_height() * 0.5;
+
         draw_line(cx - 6.0, cy, cx + 6.0, cy, 2.0, COLOR_BLACK);
         draw_line(cx, cy - 6.0, cx, cy + 6.0, 2.0, COLOR_BLACK);
+
+        draw_hud(state);
     }
 
-    fn color_for_elevation(l: i16, x: usize, y: usize, world_seed: u64) -> Color {
-        let block_x = x / 2;
-        let block_y = y / 2;
-        let seed = (world_seed as u32).wrapping_add(1013904223);
+    fn draw_sprite_fast(
+        &self,
+        _sprite_id: u32,
+        sprite: &RenderSprite,
+        pos: Vec3,
+        yaw: f32,
+        scale: f32,
+        cam_right: Vec3,
+        cam_up: Vec3,
+    ) -> bool {
+        let mut drew = false;
 
-        let h = (block_x as u32)
-            .wrapping_mul(374761393)
-            .wrapping_add((block_y as u32).wrapping_mul(668265263))
-            ^ seed;
-        let rand_val = (h ^ (h >> 13)) & 3;
-
-        if l <= WATER_ELEVATION {
-            COLOR_BLUE
-        } else if l < ROCK_ELEVATION {
-            if rand_val == 0 {
-                COLOR_GREEN
-            } else {
-                COLOR_LTGREEN
-            }
-        } else if l < SNOW_ELEVATION {
-            if (rand_val & 3) == 0 {
-                if (rand_val & 1) == 0 {
-                    COLOR_LTGRAY
-                } else {
-                    COLOR_DKGRAY
-                }
-            } else {
-                COLOR_LTGREEN
-            }
-        } else {
-            if (rand_val & 3) == 0 {
-                COLOR_WHITE
-            } else {
-                COLOR_LTGRAY
-            }
-        }
-    }
-
-    fn build_terrain_chunks(world: &World) -> Vec<Mesh> {
-        let half_w = (MAP_WIDTH as f32 * 0.5) * WORLD_SPACING;
-        let half_h = (MAP_HEIGHT as f32 * 0.5) * WORLD_SPACING;
-
-        let num_chunks_x = (MESH_SIZE - 1) / CHUNK_QUADS;
-        let num_chunks_z = (MESH_SIZE - 1) / CHUNK_QUADS;
-
-        let mut chunks = Vec::new();
-
-        for cz in 0..num_chunks_z {
-            let mz_start = cz * CHUNK_QUADS;
-            let mz_end = (mz_start + CHUNK_QUADS).min(MESH_SIZE - 1);
-            let chunk_h = mz_end - mz_start;
-
-            for cx in 0..num_chunks_x {
-                let mx_start = cx * CHUNK_QUADS;
-                let mx_end = (mx_start + CHUNK_QUADS).min(MESH_SIZE - 1);
-                let chunk_w = mx_end - mx_start;
-
-                let mut vertices = Vec::with_capacity(chunk_w * chunk_h * 4);
-                let mut indices = Vec::with_capacity(chunk_w * chunk_h * 6);
-
-                for mz in mz_start..mz_end {
-                    let gy0 = mz * WORLD_STEP;
-                    let gy1 = (mz + 1) * WORLD_STEP;
-
-                    let wz0 = gy0 as f32 * WORLD_SPACING - half_h;
-                    let wz1 = gy1 as f32 * WORLD_SPACING - half_h;
-
-                    for mx in mx_start..mx_end {
-                        let gx0 = mx * WORLD_STEP;
-                        let gx1 = (mx + 1) * WORLD_STEP;
-
-                        let wx0 = gx0 as f32 * WORLD_SPACING - half_w;
-                        let wx1 = gx1 as f32 * WORLD_SPACING - half_w;
-
-                        let e00 = world.get_raw_elevation(gx0, gy0);
-                        let e10 = world.get_raw_elevation(gx1, gy0);
-                        let e11 = world.get_raw_elevation(gx1, gy1);
-                        let e01 = world.get_raw_elevation(gx0, gy1);
-
-                        let wy00 = e00 as f32 / MAP_SCALE as f32;
-                        let wy10 = e10 as f32 / MAP_SCALE as f32;
-                        let wy11 = e11 as f32 / MAP_SCALE as f32;
-                        let wy01 = e01 as f32 / MAP_SCALE as f32;
-
-                        let avg_e = (e00 as i32 + e10 as i32 + e11 as i32 + e01 as i32) / 4;
-                        let col = Self::color_for_elevation(avg_e as i16, gx0, gy0, world.seed);
-
-                        let base = vertices.len() as u16;
-
-                        vertices.push(Vertex::new2(vec3(wx0, wy00, wz0), vec2(0.0, 0.0), col));
-                        vertices.push(Vertex::new2(vec3(wx1, wy10, wz0), vec2(1.0, 0.0), col));
-                        vertices.push(Vertex::new2(vec3(wx1, wy11, wz1), vec2(1.0, 1.0), col));
-                        vertices.push(Vertex::new2(vec3(wx0, wy01, wz1), vec2(0.0, 1.0), col));
-
-                        indices.push(base);
-                        indices.push(base + 3);
-                        indices.push(base + 1);
-
-                        indices.push(base + 1);
-                        indices.push(base + 3);
-                        indices.push(base + 2);
-                    }
-                }
-
-                chunks.push(Mesh {
-                    vertices,
-                    indices,
-                    texture: None,
-                });
-            }
+        if !sprite.meshes.is_empty() {
+            draw_meshes_transformed(&sprite.meshes, pos, yaw, scale);
+            drew = true;
         }
 
-        chunks
+        if !sprite.lines.is_empty() {
+            draw_lines_3d_fast(&sprite.lines, pos, scale, cam_right, cam_up);
+            drew = true;
+        }
+
+        drew
+    }
+}
+
+fn calculate_dynamic_fovy(aspect: f32) -> f32 {
+    const DIAGONAL_FACTOR: f32 = 1.482;
+    let aspect = aspect.max(0.1);
+    let half_fovy_tan = DIAGONAL_FACTOR / (1.0 + aspect * aspect).sqrt();
+    2.0 * half_fovy_tan.atan()
+}
+
+fn draw_hud(state: &GameState) {
+    let bird = &state.bird;
+    let forward = bird.forward();
+    let right = bird.right();
+    let up = bird.up();
+
+    let pitch_deg = forward.y.clamp(-1.0, 1.0).asin().to_degrees();
+    let roll_deg = (-right.y).atan2(up.y).to_degrees();
+    let mut heading_deg = forward.x.atan2(-forward.z).to_degrees();
+    if heading_deg < 0.0 {
+        heading_deg += 360.0;
     }
 
-    fn build_water_mesh(world: &World) -> Mesh {
-        let bounds = world.world_bounds() + 100.0;
-        let y = (WATER_ELEVATION as f32) / (MAP_SCALE as f32);
-        let c = COLOR_BLUE;
+    let ground = state.world.get_height(bird.pos.x, bird.pos.z);
+    let height = (bird.pos.y - ground).round() as i32;
 
-        let vertices = vec![
-            Vertex::new2(vec3(-bounds, y, -bounds), vec2(0.0, 0.0), c),
-            Vertex::new2(vec3(bounds, y, -bounds), vec2(1.0, 0.0), c),
-            Vertex::new2(vec3(bounds, y, bounds), vec2(1.0, 1.0), c),
-            Vertex::new2(vec3(-bounds, y, bounds), vec2(0.0, 1.0), c),
-        ];
+    let line1 = format!(
+        "Pitch:{:5.1} Roll:{:5.1} Heading:{:5.1} Height:{:5}",
+        pitch_deg, roll_deg, heading_deg, height
+    );
+    let line2 = format!(
+        "Fish Remaining:{} Time:{:3.2} Best:{:3.2}",
+        state.fish_remaining(),
+        state.elapsed,
+        state.best_time
+    );
 
-        let indices = vec![0, 2, 1, 0, 3, 2];
+    let font_size = 20.0;
+    draw_text(&line1, 8.0, 20.0, font_size, COLOR_BLACK);
+    draw_text(&line2, 8.0, 42.0, font_size, COLOR_BLACK);
 
-        Mesh {
+    let fps_text = format!("FPS: {}", get_fps());
+    let fps_dims = measure_text(&fps_text, None, font_size as u16, 1.0);
+    draw_text(
+        &fps_text,
+        screen_width() - fps_dims.width - 10.0,
+        20.0,
+        font_size,
+        COLOR_BLACK,
+    );
+
+    if state.alive && !state.won && state.elapsed < 5.0 {
+        let blink_on = ((get_time() * 2.0) as u32) % 2 == 0;
+        if blink_on {
+            let msg = "Catch 10 Fish";
+            let prompt_size = 28.0;
+            let dims = measure_text(msg, None, prompt_size as u16, 1.0);
+            draw_text(
+                msg,
+                (screen_width() - dims.width) * 0.5,
+                screen_height() * 0.5 - 64.0,
+                prompt_size,
+                COLOR_WHITE,
+            );
+        }
+    }
+}
+
+fn model_matrix(pos: Vec3, yaw: f32, scale: f32) -> Mat4 {
+    Mat4::from_translation(pos)
+        * Mat4::from_rotation_y(-yaw)
+        * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+        * Mat4::from_scale(Vec3::splat(scale))
+}
+
+fn draw_meshes_transformed(meshes: &[Mesh], pos: Vec3, yaw: f32, scale: f32) {
+    let model = model_matrix(pos, yaw, scale);
+    unsafe { get_internal_gl() }
+        .quad_gl
+        .push_model_matrix(model);
+    for mesh in meshes {
+        draw_mesh(mesh);
+    }
+    unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
+}
+
+fn draw_lines_3d_fast(lines: &[SpriteLine], pos: Vec3, scale: f32, cam_right: Vec3, cam_up: Vec3) {
+    let s = SPRITE_SCALE * scale;
+    for line in lines {
+        let p1 = pos + cam_right * (line.x1 as f32 * s) - cam_up * (line.y1 as f32 * s);
+        let p2 = pos + cam_right * (line.x2 as f32 * s) - cam_up * (line.y2 as f32 * s);
+        draw_line_3d(p1, p2, line.color);
+    }
+}
+
+fn build_interpolated_meshes(a: &RenderSprite, b: &RenderSprite, t: f32) -> Option<Vec<Mesh>> {
+    if a.meshes.is_empty() || a.meshes.len() != b.meshes.len() {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(a.meshes.len());
+
+    for (ma, mb) in a.meshes.iter().zip(&b.meshes) {
+        if ma.vertices.len() != mb.vertices.len() || ma.indices != mb.indices {
+            return None;
+        }
+
+        let vertices = ma
+            .vertices
+            .iter()
+            .zip(&mb.vertices)
+            .map(|(va, vb)| {
+                let mut v = *va;
+                v.position = va.position.lerp(vb.position, t);
+                v
+            })
+            .collect();
+
+        out.push(Mesh {
             vertices,
-            indices,
-            texture: None,
-        }
+            indices: ma.indices.clone(),
+            texture: ma.texture.clone(),
+        });
     }
+
+    Some(out)
 }

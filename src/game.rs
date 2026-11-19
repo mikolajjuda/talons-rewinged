@@ -5,13 +5,17 @@ use macroquad::prelude::*;
 
 const SPAWN_CLEARANCE: f32 = 40.0;
 const CATCH_RADIUS: f32 = 8.0;
+pub const TARGET_FISH: u32 = 10;
 
 pub struct GameState {
     pub world: World,
     pub bird: BirdState,
     pub flight_model: Box<dyn FlightModel>,
     pub alive: bool,
+    pub won: bool,
     pub score: u32,
+    pub elapsed: f32,
+    pub best_time: f32,
 }
 
 impl GameState {
@@ -34,7 +38,10 @@ impl GameState {
             bird,
             flight_model: model,
             alive: true,
+            won: false,
             score: 0,
+            elapsed: 0.0,
+            best_time: 9999.0,
         }
     }
 
@@ -50,7 +57,10 @@ impl GameState {
             bird,
             flight_model: model,
             alive: true,
+            won: false,
             score: 0,
+            elapsed: 0.0,
+            best_time: 9999.0,
         }
     }
 
@@ -60,15 +70,23 @@ impl GameState {
         self.flight_model.reset(spawn);
         self.bird = *self.flight_model.state();
         self.alive = true;
+        self.won = false;
         self.score = 0;
+        self.elapsed = 0.0;
+    }
+
+    pub fn fish_remaining(&self) -> u32 {
+        TARGET_FISH.saturating_sub(self.score)
     }
 
     pub fn update(&mut self, input: &GameInputs, dt: f32) {
-        if !self.alive {
+        if !self.alive || self.won {
             return;
         }
 
+        self.elapsed += dt.max(0.0);
         self.bird = *self.flight_model.update(input, &self.world, dt);
+        self.world.update(dt);
 
         let ground = self.world.get_height(self.bird.pos.x, self.bird.pos.z);
         let water_h = (WATER_ELEVATION as f32) / (MAP_SCALE as f32);
@@ -81,6 +99,10 @@ impl GameState {
                 if !fish.caught && self.bird.pos.distance(fish.pos) < CATCH_RADIUS {
                     fish.caught = true;
                     self.score += 1;
+                    if self.score >= TARGET_FISH {
+                        self.won = true;
+                        break;
+                    }
                 }
             }
         }
