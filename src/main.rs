@@ -29,10 +29,17 @@ async fn main() {
     let dummy_world = world::World::new(1);
     let mut renderer = Renderer::new(&dummy_world);
     let mut audio = AudioSystem::new();
+    let mut fullscreen = false;
 
     loop {
         let out = input.poll();
         let dt = get_frame_time();
+
+        let alt_down = is_key_down(KeyCode::LeftAlt) || is_key_down(KeyCode::RightAlt);
+        if is_key_pressed(KeyCode::F11) || (alt_down && is_key_pressed(KeyCode::Enter)) {
+            fullscreen = !fullscreen;
+            set_fullscreen(fullscreen);
+        }
 
         if is_key_pressed(KeyCode::M) {
             audio.toggle_mute();
@@ -56,7 +63,7 @@ async fn main() {
                     audio.stop_music();
                     screen = Screen::MainMenu;
                 } else {
-                    if is_key_pressed(KeyCode::Enter) {
+                    if !alt_down && is_key_pressed(KeyCode::Enter) {
                         state.reset();
                     }
 

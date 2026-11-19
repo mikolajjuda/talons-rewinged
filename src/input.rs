@@ -1,7 +1,11 @@
-use gilrs::{Axis, Button, Event, EventType, GamepadId, Gilrs};
 use macroquad::input::get_keys_down;
+use sdl2::JoystickSubsystem;
+use sdl2::event::Event;
+use sdl2::joystick::{HatState, Joystick};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -123,6 +127,7 @@ impl InputConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct DeviceState {
     pub name: String,
     pub connected: bool,
@@ -138,10 +143,23 @@ pub struct GameInputs {
     pub switch: bool,
 }
 
+struct PadEntry {
+    instance_id: u32,
+    _joystick: Joystick,
+    state: DeviceState,
+}
+
+#[derive(Default)]
+struct SharedPads {
+    version: u64,
+    pads: Vec<DeviceState>,
+}
+
 pub struct InputSystem {
-    pub gilrs: Gilrs,
+    shared: Arc<Mutex<SharedPads>>,
+    last_version: u64,
     pub keyboard: DeviceState,
-    pub pads: Vec<(GamepadId, DeviceState)>,
+    pads_snapshot: Vec<DeviceState>,
     pub cfg: InputConfig,
     pub config_path: String,
     pub status: String,
@@ -150,35 +168,198 @@ pub struct InputSystem {
 
 impl InputSystem {
     pub fn new(config_path: &str) -> Self {
-        let gilrs = Gilrs::new().expect("gilrs init failed");
-        let mut pads = Vec::new();
-        for (id, pad) in gilrs.gamepads() {
-            if pad.is_connected() {
-                pads.push((
-                    id,
-                    DeviceState {
-                        name: pad.name().to_string(),
-                        connected: true,
-                        axes: BTreeMap::new(),
-                        buttons: BTreeMap::new(),
-                    },
-                ));
-            }
-        }
+        let shared = Arc::new(Mutex::new(SharedPads::default()));
+        let shared_bg = Arc::clone(&shared);
+
+        thread::spawn(move || Self::joystick_thread(shared_bg));
+
         let (cfg, status) = InputConfig::load_or_default(config_path);
         Self {
-            gilrs,
+            shared,
+            last_version: 0,
             keyboard: DeviceState {
                 name: "Keyboard".into(),
                 connected: true,
                 axes: BTreeMap::new(),
                 buttons: BTreeMap::new(),
             },
-            pads,
+            pads_snapshot: Vec::new(),
             cfg,
             config_path: config_path.to_string(),
             status,
             selected: 0,
+        }
+    }
+
+    fn joystick_thread(shared: Arc<Mutex<SharedPads>>) {
+        sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+        sdl2::hint::set("SDL_JOYSTICK_THREAD", "1");
+        sdl2::hint::set("SDL_JOYSTICK_WGI", "0");
+
+        let sdl = sdl2::init().expect("sdl2 init failed");
+        let joystick_sub = sdl.joystick().expect("sdl2 joystick init failed");
+        let mut event_pump = sdl.event_pump().expect("sdl2 event_pump failed");
+
+        let mut local_pads = Vec::new();
+        match joystick_sub.num_joysticks() {
+            Ok(count) => {
+                for idx in 0..count {
+                    match joystick_sub.open(idx) {
+                        Ok(joy) => local_pads.push(Self::make_pad_entry(joy)),
+                        Err(e) => eprintln!("sdl2 joystick open({idx}) failed: {e}"),
+                    }
+                }
+            }
+            Err(e) => eprintln!("sdl2 num_joysticks failed: {e}"),
+        }
+
+        if let Ok(mut guard) = shared.lock() {
+            guard.pads = local_pads.iter().map(|p| p.state.clone()).collect();
+            guard.version = guard.version.wrapping_add(1);
+        }
+
+        loop {
+            if let Some(first) = event_pump.wait_event_timeout(4) {
+                let mut changed = Self::handle_event(first, &joystick_sub, &mut local_pads);
+                while let Some(ev) = event_pump.poll_event() {
+                    if Self::handle_event(ev, &joystick_sub, &mut local_pads) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(mut guard) = shared.lock() {
+                        guard.pads = local_pads.iter().map(|p| p.state.clone()).collect();
+                        guard.version = guard.version.wrapping_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_event(
+        event: Event,
+        joystick_sub: &JoystickSubsystem,
+        pads: &mut Vec<PadEntry>,
+    ) -> bool {
+        match event {
+            Event::JoyDeviceAdded { which, .. } => match joystick_sub.open(which) {
+                Ok(joy) => {
+                    let id = joy.instance_id();
+                    let entry = Self::make_pad_entry(joy);
+                    if let Some(existing) = pads.iter_mut().find(|p| p.instance_id == id) {
+                        *existing = entry;
+                    } else {
+                        pads.push(entry);
+                    }
+                    true
+                }
+                Err(e) => {
+                    eprintln!("sdl2 joystick hotplug open({which}) failed: {e}");
+                    false
+                }
+            },
+            Event::JoyDeviceRemoved { which, .. } => {
+                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
+                    p.state.connected = false;
+                    true
+                } else {
+                    false
+                }
+            }
+            Event::JoyAxisMotion {
+                which,
+                axis_idx,
+                value,
+                ..
+            } => {
+                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
+                    p.state
+                        .axes
+                        .insert(format!("Axis{axis_idx}"), Self::norm_axis(value));
+                    true
+                } else {
+                    false
+                }
+            }
+            Event::JoyButtonDown {
+                which, button_idx, ..
+            } => {
+                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
+                    p.state.buttons.insert(format!("Button{button_idx}"), true);
+                    true
+                } else {
+                    false
+                }
+            }
+            Event::JoyButtonUp {
+                which, button_idx, ..
+            } => {
+                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
+                    p.state.buttons.insert(format!("Button{button_idx}"), false);
+                    true
+                } else {
+                    false
+                }
+            }
+            Event::JoyHatMotion {
+                which,
+                hat_idx,
+                state,
+                ..
+            } => {
+                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
+                    let (hx, hy) = match state {
+                        HatState::Centered => (0.0, 0.0),
+                        HatState::Up => (0.0, 1.0),
+                        HatState::Down => (0.0, -1.0),
+                        HatState::Left => (-1.0, 0.0),
+                        HatState::Right => (1.0, 0.0),
+                        HatState::LeftUp => (-1.0, 1.0),
+                        HatState::LeftDown => (-1.0, -1.0),
+                        HatState::RightUp => (1.0, 1.0),
+                        HatState::RightDown => (1.0, -1.0),
+                    };
+                    p.state.axes.insert(format!("Hat{hat_idx}X"), hx);
+                    p.state.axes.insert(format!("Hat{hat_idx}Y"), hy);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn make_pad_entry(joy: Joystick) -> PadEntry {
+        let mut axes = BTreeMap::new();
+        for a in 0..joy.num_axes() {
+            if let Ok(val) = joy.axis(a) {
+                axes.insert(format!("Axis{a}"), Self::norm_axis(val));
+            }
+        }
+        let mut buttons = BTreeMap::new();
+        for b in 0..joy.num_buttons() {
+            if let Ok(pressed) = joy.button(b) {
+                buttons.insert(format!("Button{b}"), pressed);
+            }
+        }
+        PadEntry {
+            instance_id: joy.instance_id(),
+            state: DeviceState {
+                name: joy.name(),
+                connected: joy.attached(),
+                axes,
+                buttons,
+            },
+            _joystick: joy,
+        }
+    }
+
+    fn norm_axis(v: i16) -> f32 {
+        if v < 0 {
+            v as f32 / 32768.0
+        } else {
+            v as f32 / 32767.0
         }
     }
 
@@ -188,7 +369,7 @@ impl InputSystem {
 
     pub fn devices(&self) -> Vec<&DeviceState> {
         let mut devs = vec![&self.keyboard];
-        devs.extend(self.pads.iter().map(|(_, d)| d).filter(|d| d.connected));
+        devs.extend(self.pads_snapshot.iter().filter(|d| d.connected));
         devs
     }
 
@@ -200,52 +381,10 @@ impl InputSystem {
             self.keyboard.buttons.insert(format!("{k:?}"), true);
         }
 
-        while let Some(Event { id, event, .. }) = self.gilrs.next_event() {
-            let pad_name = self.gilrs.gamepad(id).name().to_string();
-            let dev = if let Some((_, d)) = self.pads.iter_mut().find(|(pid, _)| *pid == id) {
-                d
-            } else {
-                self.pads.push((
-                    id,
-                    DeviceState {
-                        name: pad_name.clone(),
-                        connected: true,
-                        axes: BTreeMap::new(),
-                        buttons: BTreeMap::new(),
-                    },
-                ));
-                &mut self.pads.last_mut().unwrap().1
-            };
-            dev.name = pad_name;
-
-            match event {
-                EventType::Connected => dev.connected = true,
-                EventType::Disconnected => dev.connected = false,
-                EventType::AxisChanged(axis, val, code) => {
-                    let key = if axis != Axis::Unknown {
-                        format!("{axis:?}")
-                    } else {
-                        format!("{code:?}")
-                    };
-                    dev.axes.insert(key, val);
-                }
-                EventType::ButtonPressed(btn, code) => {
-                    let key = if btn != Button::Unknown {
-                        format!("{btn:?}")
-                    } else {
-                        format!("{code:?}")
-                    };
-                    dev.buttons.insert(key, true);
-                }
-                EventType::ButtonReleased(btn, code) => {
-                    let key = if btn != Button::Unknown {
-                        format!("{btn:?}")
-                    } else {
-                        format!("{code:?}")
-                    };
-                    dev.buttons.insert(key, false);
-                }
-                _ => {}
+        if let Ok(guard) = self.shared.lock() {
+            if guard.version != self.last_version {
+                self.pads_snapshot = guard.pads.clone();
+                self.last_version = guard.version;
             }
         }
 
@@ -264,9 +403,8 @@ impl InputSystem {
         if p == "keyboard" {
             return vec![&self.keyboard];
         }
-        self.pads
+        self.pads_snapshot
             .iter()
-            .map(|(_, d)| d)
             .filter(|d| {
                 d.connected
                     && (p == "*" || p.is_empty() || d.name.to_ascii_lowercase().contains(&p))
@@ -334,17 +472,13 @@ impl InputSystem {
     }
 
     fn eval_axis(&self, b: &AxisBinding, default_b: &AxisBinding, unipolar: bool) -> f32 {
-        // 1. Keyboard button presses ALWAYS override controller axes:
-        // Check active binding buttons on keyboard
         if let Some(val) = self.eval_binding_on_dev(b, &self.keyboard, unipolar) {
             return val;
         }
-        // Check default keyboard buttons on keyboard (seamless fallback if controller disconnected)
         if let Some(val) = self.eval_binding_on_dev(default_b, &self.keyboard, unipolar) {
             return val;
         }
 
-        // 2. If no keyboard button is pressed, read matching device (gamepad controller)
         for dev in self.matching_devices(&b.pad) {
             if let Some(id) = &b.axis {
                 if let Some(&raw_val) = dev.axes.get(id) {
@@ -360,10 +494,9 @@ impl InputSystem {
     }
 
     fn eval_switch(&self, b: &SwitchBinding, default_b: &SwitchBinding) -> bool {
-        // 1. Check keyboard first (configured button on keyboard OR default Space on keyboard)
         if let Some(btn) = &b.button {
             if self.keyboard.buttons.get(btn).copied().unwrap_or(false) {
-                return if b.invert { false } else { true };
+                return !b.invert;
             }
         }
         if let Some(btn) = &default_b.button {
@@ -372,7 +505,6 @@ impl InputSystem {
             }
         }
 
-        // 2. Check matching device (gamepad controller)
         for dev in self.matching_devices(&b.pad) {
             if dev.name != "Keyboard" {
                 if let Some(btn) = &b.button {
