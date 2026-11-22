@@ -1,363 +1,130 @@
-mod assets;
+mod birds;
+mod chunks;
 mod claws;
-mod palette;
+mod fish;
+mod governor;
+mod horizon;
+mod hud;
+mod sprites;
 mod terrain;
+mod view;
 
-use crate::game::GameState;
+use crate::game::Game;
+use crate::palette;
+use crate::sprites::id;
 use crate::world::World;
-use macroquad::models::{Mesh, draw_mesh, draw_sphere};
+use birds::BirdFlock;
+use chunks::{ChunkSet, Tiler};
+use governor::Governor;
 use macroquad::prelude::*;
+use sprites::{LANDSCAPE_SCALE, SpriteLibrary};
+use view::View;
 
-use self::assets::{RenderAssets, RenderSprite, SPRITE_SCALE, SpriteLine};
-use self::palette::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
-use self::terrain::{TerrainChunk, build_terrain_chunks, build_water_mesh};
+const TERRAIN_MAX_DISTANCE: f32 = 2200.0;
+const TREE_MAX_DISTANCE: f32 = 380.0;
+const BOAT_MAX_DISTANCE: f32 = 500.0;
+const PROP_TILE_EXTENT: f32 = 96.0;
 
-const LANDSCAPE_SCALE: f32 = 2.0;
-
-const TREE_MAX_DIST_SQ: f32 = 380.0 * 380.0;
-const BOAT_MAX_DIST_SQ: f32 = 500.0 * 500.0;
-const BIRD_MAX_DIST_SQ: f32 = 500.0 * 500.0;
-const FISH_MAX_DIST_SQ: f32 = 350.0 * 350.0;
-const TERRAIN_MAX_DIST_SQ: f32 = 750.0 * 750.0;
-
-const BIRD_VERTEX_SHADER: &str = r#"#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-attribute vec4 normal;
-
-varying lowp vec4 color;
-
-uniform mat4 Model;
-uniform mat4 Projection;
-uniform float flap_t;
-
-void main() {
-    vec3 animated_pos = mix(position, normal.xyz, flap_t);
-    gl_Position = Projection * Model * vec4(animated_pos, 1.0);
-    color = color0 / 255.0;
+struct Scene {
+    revision: u64,
+    terrain: ChunkSet,
+    trees: ChunkSet,
+    boats: ChunkSet,
 }
-"#;
 
-const BIRD_FRAGMENT_SHADER: &str = r#"#version 100
-varying lowp vec4 color;
+impl Scene {
+    fn build(world: &World, sprites: &SpriteLibrary) -> Self {
+        let mut trees = Tiler::new(PROP_TILE_EXTENT);
+        for tree in &world.trees {
+            sprites.bake(&mut trees, id::TREE, tree.pos, LANDSCAPE_SCALE);
+        }
 
-void main() {
-    gl_FragColor = color;
+        let mut boats = Tiler::new(PROP_TILE_EXTENT);
+        for boat in &world.boats {
+            sprites.bake(&mut boats, boat.sprite, boat.pos, LANDSCAPE_SCALE);
+        }
+
+        Self {
+            revision: world.revision(),
+            terrain: terrain::build(world),
+            trees: trees.finish(),
+            boats: boats.finish(),
+        }
+    }
 }
-"#;
 
 pub struct Renderer {
-    terrain_chunks: Vec<TerrainChunk>,
-    water_mesh: Mesh,
-    assets: RenderAssets,
-    bird_material: Material,
-    world_seed: u64,
+    sprites: SpriteLibrary,
+    birds: BirdFlock,
+    governor: Governor,
+    scene: Option<Scene>,
 }
 
 impl Renderer {
-    pub fn new(world: &World) -> Self {
-        let bird_material = load_material(
-            ShaderSource::Glsl {
-                vertex: BIRD_VERTEX_SHADER,
-                fragment: BIRD_FRAGMENT_SHADER,
-            },
-            MaterialParams {
-                uniforms: vec![UniformDesc::new("flap_t", UniformType::Float1)],
-                pipeline_params: PipelineParams {
-                    depth_write: true,
-                    depth_test: Comparison::LessOrEqual,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .expect("Failed to compile bird morph material");
-
+    pub fn new() -> Self {
         Self {
-            terrain_chunks: build_terrain_chunks(world),
-            water_mesh: build_water_mesh(world),
-            assets: RenderAssets::new(),
-            bird_material,
-            world_seed: world.seed,
+            sprites: SpriteLibrary::load(),
+            birds: BirdFlock::new(),
+            governor: Governor::new(),
+            scene: None,
         }
     }
 
-    pub fn draw(&mut self, state: &GameState) {
-        let world = &state.world;
-        let bird = &state.bird;
+    pub fn observe_frame(&mut self, frame_time: f32) {
+        self.governor.observe(frame_time);
+    }
 
-        if world.seed != self.world_seed {
-            self.terrain_chunks = build_terrain_chunks(world);
-            self.water_mesh = build_water_mesh(world);
-            self.world_seed = world.seed;
-        }
-
-        let forward = bird.forward();
-        let cam_right = bird.right();
-        let cam_up = bird.up();
-
-        let w = screen_width();
-        let h = screen_height();
-        let aspect = w / h.max(1.0);
-        let fovy = calculate_dynamic_fovy(aspect);
-
-        let camera = Camera3D {
-            position: bird.pos,
-            target: bird.pos + forward * 50.0,
-            up: cam_up,
-            fovy,
-            projection: Projection::Perspective,
-            ..Default::default()
-        };
-
-        set_camera(&camera);
-
-        for chunk in &self.terrain_chunks {
-            let to_chunk = chunk.center - bird.pos;
-            let dist_sq = to_chunk.length_squared();
-            let max_reach = TERRAIN_MAX_DIST_SQ + chunk.radius * chunk.radius;
-            if dist_sq > max_reach || to_chunk.dot(forward) < -chunk.radius {
-                continue;
-            }
-            draw_mesh(&chunk.mesh);
-        }
-
-        draw_mesh(&self.water_mesh);
-
-        let fish_sprite = self.assets.get(1);
-        for fish in &world.fishes {
-            if fish.caught {
-                continue;
-            }
-            let delta = fish.pos - bird.pos;
-            if delta.length_squared() > FISH_MAX_DIST_SQ || delta.dot(forward) < -10.0 {
-                continue;
-            }
-
-            if !self.draw_sprite_fast(1, fish_sprite, fish.pos, 0.0, 1.0, cam_right, cam_up) {
-                draw_sphere(fish.pos, 2.0, None, COLOR_RED);
-                let tail_dir = vec3(fish.angle.cos(), 0.0, fish.angle.sin()) * 3.0;
-                draw_line_3d(fish.pos, fish.pos - tail_dir, COLOR_WHITE);
-            }
-        }
-
-        for boat in &world.boats {
-            let delta = boat.pos - bird.pos;
-            if delta.length_squared() > BOAT_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
-                continue;
-            }
-
-            let sprite = self.assets.get(boat.sprite_id);
-            if !self.draw_sprite_fast(
-                boat.sprite_id,
-                sprite,
-                boat.pos,
-                0.0,
-                LANDSCAPE_SCALE,
-                cam_right,
-                cam_up,
-            ) {
-                draw_cube(boat.pos, vec3(4.0, 2.0, 2.0), None, COLOR_WHITE);
-            }
-        }
-
-        let tree_sprite = self.assets.get(6);
-        for tree in &world.trees {
-            let delta = tree.pos - bird.pos;
-            if delta.length_squared() > TREE_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
-                continue;
-            }
-
-            if !self.draw_sprite_fast(
-                6,
-                tree_sprite,
-                tree.pos,
-                0.0,
-                LANDSCAPE_SCALE,
-                cam_right,
-                cam_up,
-            ) {
-                draw_line_3d(
-                    tree.pos,
-                    tree.pos + vec3(0.0, 2.0, 0.0),
-                    Color::new(0.45, 0.25, 0.1, 1.0),
-                );
-                draw_sphere(
-                    tree.pos + vec3(0.0, 3.0, 0.0),
-                    1.5,
-                    None,
-                    Color::new(0.0, 0.65, 0.0, 1.0),
-                );
-            }
-        }
-
-        // Continuous triangle wave flap animation directly in vertex shader
-        let phase = (get_time() as f32 / 0.2).fract();
-        let flap_t = if phase < 0.5 {
-            phase * 2.0
-        } else {
-            (1.0 - phase) * 2.0
-        };
-
-        if !self.assets.morph_bird_meshes.is_empty() {
-            gl_use_material(&self.bird_material);
-            self.bird_material.set_uniform("flap_t", flap_t);
-
-            for other_bird in &world.birds {
-                let delta = other_bird.pos - bird.pos;
-                if delta.length_squared() > BIRD_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
-                    continue;
-                }
-
-                draw_meshes_transformed(
-                    &self.assets.morph_bird_meshes,
-                    other_bird.pos,
-                    other_bird.angle,
-                    1.0,
-                );
-            }
-
-            gl_use_default_material();
-        } else {
-            for other_bird in &world.birds {
-                let delta = other_bird.pos - bird.pos;
-                if delta.length_squared() > BIRD_MAX_DIST_SQ || delta.dot(forward) < -20.0 {
-                    continue;
-                }
-                let wing = vec3(-other_bird.angle.sin(), 0.0, other_bird.angle.cos()) * 1.5;
-                draw_line_3d(other_bird.pos - wing, other_bird.pos + wing, COLOR_WHITE);
-            }
-        }
+    pub fn draw(&mut self, game: &Game, show_fps: bool) {
+        self.ensure_scene(game.world());
 
         set_default_camera();
+        let view = View::new(game.bird());
 
-        claws::draw_claws(&self.assets, bird.claws_down);
+        draw_background(game, &view);
+        self.draw_world(game, &view);
 
-        let cx = screen_width() * 0.5;
-        let cy = screen_height() * 0.5;
-
-        draw_line(cx - 6.0, cy, cx + 6.0, cy, 2.0, COLOR_BLACK);
-        draw_line(cx, cy - 6.0, cx, cy + 6.0, 2.0, COLOR_BLACK);
-
-        draw_hud(state);
+        set_default_camera();
+        claws::draw_claws(&self.sprites, game.claws_down());
+        hud::draw(game, show_fps);
     }
 
-    fn draw_sprite_fast(
-        &self,
-        _sprite_id: u32,
-        sprite: &RenderSprite,
-        pos: Vec3,
-        yaw: f32,
-        scale: f32,
-        cam_right: Vec3,
-        cam_up: Vec3,
-    ) -> bool {
-        let mut drew = false;
+    fn ensure_scene(&mut self, world: &World) {
+        let current = self
+            .scene
+            .as_ref()
+            .is_some_and(|scene| scene.revision == world.revision());
 
-        if !sprite.meshes.is_empty() {
-            draw_meshes_transformed(&sprite.meshes, pos, yaw, scale);
-            drew = true;
-        }
-
-        if !sprite.lines.is_empty() {
-            draw_lines_3d_fast(&sprite.lines, pos, scale, cam_right, cam_up);
-            drew = true;
-        }
-
-        drew
-    }
-}
-
-fn calculate_dynamic_fovy(aspect: f32) -> f32 {
-    const DIAGONAL_FACTOR: f32 = 1.482;
-    let aspect = aspect.max(0.1);
-    let half_fovy_tan = DIAGONAL_FACTOR / (1.0 + aspect * aspect).sqrt();
-    2.0 * half_fovy_tan.atan()
-}
-
-fn draw_hud(state: &GameState) {
-    let bird = &state.bird;
-    let forward = bird.forward();
-    let right = bird.right();
-    let up = bird.up();
-
-    let pitch_deg = forward.y.clamp(-1.0, 1.0).asin().to_degrees();
-    let roll_deg = (-right.y).atan2(up.y).to_degrees();
-    let mut heading_deg = forward.x.atan2(-forward.z).to_degrees();
-    if heading_deg < 0.0 {
-        heading_deg += 360.0;
-    }
-
-    let ground = state.world.get_height(bird.pos.x, bird.pos.z);
-    let height = (bird.pos.y - ground).round() as i32;
-    let speed = bird.speed();
-
-    let line1 = format!(
-        "Pitch:{:5.1} Roll:{:5.1} Heading:{:5.1} Height:{:5} Speed:{:5.1}",
-        pitch_deg, roll_deg, heading_deg, height, speed
-    );
-    let line2 = format!(
-        "Fish Remaining:{} Time:{:3.2} Best:{:3.2}",
-        state.fish_remaining(),
-        state.elapsed,
-        state.best_time
-    );
-
-    let font_size = 20.0;
-    draw_text(&line1, 8.0, 20.0, font_size, COLOR_BLACK);
-    draw_text(&line2, 8.0, 42.0, font_size, COLOR_BLACK);
-
-    let fps_text = format!("FPS: {}", get_fps());
-    let fps_dims = measure_text(&fps_text, None, font_size as u16, 1.0);
-    draw_text(
-        &fps_text,
-        screen_width() - fps_dims.width - 10.0,
-        20.0,
-        font_size,
-        COLOR_BLACK,
-    );
-
-    if state.alive && !state.won && state.elapsed < 5.0 {
-        let blink_on = ((get_time() * 2.0) as u32) % 2 == 0;
-        if blink_on {
-            let msg = "Catch 10 Fish";
-            let prompt_size = 28.0;
-            let dims = measure_text(msg, None, prompt_size as u16, 1.0);
-            draw_text(
-                msg,
-                (screen_width() - dims.width) * 0.5,
-                screen_height() * 0.5 - 64.0,
-                prompt_size,
-                COLOR_WHITE,
-            );
+        if !current {
+            self.scene = Some(Scene::build(world, &self.sprites));
         }
     }
-}
 
-fn model_matrix(pos: Vec3, yaw: f32, scale: f32) -> Mat4 {
-    Mat4::from_translation(pos)
-        * Mat4::from_rotation_y(-yaw)
-        * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
-        * Mat4::from_scale(Vec3::splat(scale))
-}
+    fn draw_world(&self, game: &Game, view: &View) {
+        let Some(scene) = self.scene.as_ref() else {
+            return;
+        };
+        let world = game.world();
+        let terrain_reach = TERRAIN_MAX_DISTANCE * self.governor.scale();
 
-fn draw_meshes_transformed(meshes: &[Mesh], pos: Vec3, yaw: f32, scale: f32) {
-    let model = model_matrix(pos, yaw, scale);
-    unsafe { get_internal_gl() }
-        .quad_gl
-        .push_model_matrix(model);
-    for mesh in meshes {
-        draw_mesh(mesh);
+        set_camera(&view.camera());
+
+        scene.terrain.draw(view, terrain_reach);
+        scene.boats.draw(view, BOAT_MAX_DISTANCE.min(terrain_reach));
+        scene.trees.draw(view, TREE_MAX_DISTANCE.min(terrain_reach));
+
+        fish::draw_fish(self.sprites.get(id::FISH), world, view, terrain_reach);
+        self.birds.draw(&self.sprites, world, view, terrain_reach);
     }
-    unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
 }
 
-fn draw_lines_3d_fast(lines: &[SpriteLine], pos: Vec3, scale: f32, cam_right: Vec3, cam_up: Vec3) {
-    let s = SPRITE_SCALE * scale;
-    for line in lines {
-        let p1 = pos + cam_right * (line.x1 as f32 * s) - cam_up * (line.y1 as f32 * s);
-        let p2 = pos + cam_right * (line.x2 as f32 * s) - cam_up * (line.y2 as f32 * s);
-        draw_line_3d(p1, p2, line.color);
-    }
+fn draw_background(game: &Game, view: &View) {
+    clear_background(palette::color(palette::LTCYAN as i32));
+
+    let world = game.world();
+    let ground = if game.bird().pos.y < world.shallow_ceiling() {
+        palette::BLUE
+    } else {
+        palette::LTGREEN
+    };
+    horizon::draw_ground(view, palette::color(ground as i32));
 }

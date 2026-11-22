@@ -1,133 +1,143 @@
-use crate::flight::{BirdState, ClassicModel, DroneAcroModel, FlightModel, PhysicsModel};
+mod mode;
+mod rules;
+
+use crate::flight::{BirdState, FlightModel};
 use crate::input::GameInputs;
-use crate::world::{MAP_SCALE, WATER_ELEVATION, World};
-use macroquad::prelude::*;
+use crate::world::{MAP_SCALE, World};
+use macroquad::prelude::{Vec3, vec3};
 
-const SPAWN_CLEARANCE: f32 = 40.0;
-const CATCH_RADIUS: f32 = 8.0;
-const CATCH_RADIUS_SQ: f32 = CATCH_RADIUS * CATCH_RADIUS;
+pub use mode::Mode;
+
 pub const TARGET_FISH: u32 = 10;
-pub const LOCKED_BEST_TIME: f32 = 9999.0;
+pub const NO_BEST_TIME: f32 = 9999.0;
+const SPAWN_CLEARANCE_RAW: f32 = 64.0 * MAP_SCALE as f32;
 
-pub struct GameState {
-    pub world: World,
-    pub bird: BirdState,
-    pub flight_model: Box<dyn FlightModel>,
-    pub alive: bool,
-    pub won: bool,
-    pub score: u32,
-    pub elapsed: f32,
-    pub best_time: f32,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    Playing,
+    Crashed,
+    Won,
 }
 
-impl GameState {
-    fn spawn_pos(world: &World) -> Vec3 {
-        let x = 0.0;
-        let z = 0.0;
-        let ground = world.get_height(x, z);
-        vec3(x, ground + SPAWN_CLEARANCE, z)
-    }
+#[derive(Default)]
+pub struct Events {
+    pub fish_caught: bool,
+    pub crashed: bool,
+    pub won: bool,
+}
 
-    pub fn new_classic() -> Self {
-        let world = World::new(1337);
-        let spawn = Self::spawn_pos(&world);
-        let mut model = Box::new(ClassicModel::new(spawn));
-        model.reset(spawn);
+pub struct Game {
+    mode: Mode,
+    world: World,
+    model: Box<dyn FlightModel>,
+    bird: BirdState,
+    claws_down: f32,
+    phase: Phase,
+    score: u32,
+    elapsed: f32,
+    best_time: f32,
+}
+
+impl Game {
+    pub fn new(mode: Mode, seed: u64, best_time: f32) -> Self {
+        let world = World::new(seed);
+        let spawn = Self::spawn_point(&world);
+        let model = mode.flight_model(spawn);
         let bird = *model.state();
 
         Self {
+            mode,
             world,
+            model,
             bird,
-            flight_model: model,
-            alive: true,
-            won: false,
+            claws_down: 0.0,
+            phase: Phase::Playing,
             score: 0,
             elapsed: 0.0,
-            best_time: LOCKED_BEST_TIME,
+            best_time,
         }
     }
 
-    pub fn new_physics() -> Self {
-        let world = World::new(1337);
-        let spawn = Self::spawn_pos(&world);
-        let mut model = Box::new(PhysicsModel::new(spawn));
-        model.reset(spawn);
-        let bird = *model.state();
-
-        Self {
-            world,
-            bird,
-            flight_model: model,
-            alive: true,
-            won: false,
-            score: 0,
-            elapsed: 0.0,
-            best_time: LOCKED_BEST_TIME,
-        }
+    fn spawn_point(world: &World) -> Vec3 {
+        let ground = world.height_at(0.0, 0.0);
+        let clearance = world.height_from_raw(SPAWN_CLEARANCE_RAW);
+        vec3(0.0, ground + clearance, 0.0)
     }
 
-    pub fn new_drone() -> Self {
-        let world = World::new(1337);
-        let spawn = Self::spawn_pos(&world);
-        let mut model = Box::new(DroneAcroModel::new(spawn));
-        model.reset(spawn);
-        let bird = *model.state();
-
-        Self {
-            world,
-            bird,
-            flight_model: model,
-            alive: true,
-            won: false,
-            score: 0,
-            elapsed: 0.0,
-            best_time: LOCKED_BEST_TIME,
-        }
-    }
-
-    pub fn reset(&mut self) {
+    pub fn restart(&mut self) {
         self.world.regenerate();
-        let spawn = Self::spawn_pos(&self.world);
-        self.flight_model.reset(spawn);
-        self.bird = *self.flight_model.state();
-        self.alive = true;
-        self.won = false;
+        let spawn = Self::spawn_point(&self.world);
+        self.model.reset(spawn);
+        self.bird = *self.model.state();
+        self.claws_down = 0.0;
+        self.phase = Phase::Playing;
         self.score = 0;
         self.elapsed = 0.0;
-        self.best_time = LOCKED_BEST_TIME;
+    }
+
+    pub fn update(&mut self, input: &GameInputs, dt: f32) -> Events {
+        let mut events = Events::default();
+        if self.phase != Phase::Playing {
+            return events;
+        }
+
+        self.elapsed += dt.max(0.0);
+        self.bird = *self.model.update(input, &self.world, dt);
+        self.world.update(dt);
+
+        let outcome = rules::resolve_fishing(&self.bird, &self.world);
+        self.claws_down = outcome.claws_down;
+
+        if let Some(index) = outcome.caught {
+            self.world.fishes[index].caught = true;
+            self.score += 1;
+            events.fish_caught = true;
+
+            if self.score >= TARGET_FISH {
+                self.phase = Phase::Won;
+                self.best_time = self.best_time.min(self.elapsed);
+                events.won = true;
+                return events;
+            }
+        }
+
+        if rules::has_crashed(&self.bird, &self.world, self.mode.crash_margin()) {
+            self.phase = Phase::Crashed;
+            events.crashed = true;
+        }
+
+        events
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    pub fn bird(&self) -> &BirdState {
+        &self.bird
+    }
+
+    pub fn claws_down(&self) -> f32 {
+        self.claws_down
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    pub fn elapsed(&self) -> f32 {
+        self.elapsed
+    }
+
+    pub fn best_time(&self) -> f32 {
+        self.best_time
     }
 
     pub fn fish_remaining(&self) -> u32 {
         TARGET_FISH.saturating_sub(self.score)
-    }
-
-    pub fn update(&mut self, input: &GameInputs, dt: f32) {
-        if !self.alive || self.won {
-            return;
-        }
-
-        self.elapsed += dt.max(0.0);
-        self.bird = *self.flight_model.update(input, &self.world, dt);
-        self.world.update(dt);
-
-        let ground = self.world.get_height(self.bird.pos.x, self.bird.pos.z);
-        let water_h = (WATER_ELEVATION as f32) / (MAP_SCALE as f32);
-        if self.bird.pos.y <= ground + 0.2 && ground > water_h {
-            self.alive = false;
-        }
-
-        if self.bird.catch_armed {
-            for fish in &mut self.world.fishes {
-                if !fish.caught && self.bird.pos.distance_squared(fish.pos) < CATCH_RADIUS_SQ {
-                    fish.caught = true;
-                    self.score += 1;
-                    if self.score >= TARGET_FISH {
-                        self.won = true;
-                        // best_time is deliberately kept locked at 9999.0
-                        break;
-                    }
-                }
-            }
-        }
     }
 }

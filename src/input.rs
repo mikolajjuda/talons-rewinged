@@ -1,139 +1,15 @@
+mod config;
+mod pads;
+
 use macroquad::input::get_keys_down;
-use sdl2::JoystickSubsystem;
-use sdl2::event::Event;
-use sdl2::joystick::{HatState, Joystick};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct AxisBinding {
-    pub pad: String,
-    pub axis: Option<String>,
-    pub neg: Option<String>,
-    pub pos: Option<String>,
-    pub raw: [f32; 2],
-    pub out: [f32; 2],
-    pub deadzone: f32,
-}
+use config::{AxisBinding, InputConfig, SwitchBinding};
+use pads::{SharedPads, run_joystick_thread};
 
-impl Default for AxisBinding {
-    fn default() -> Self {
-        Self {
-            pad: String::new(),
-            axis: None,
-            neg: None,
-            pos: None,
-            raw: [-1.0, 1.0],
-            out: [-1.0, 1.0],
-            deadzone: 0.0,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct SwitchBinding {
-    pub pad: String,
-    pub button: Option<String>,
-    pub axis: Option<String>,
-    pub threshold: f32,
-    pub invert: bool,
-}
-
-impl Default for SwitchBinding {
-    fn default() -> Self {
-        Self {
-            pad: String::new(),
-            button: None,
-            axis: None,
-            threshold: 0.25,
-            invert: false,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct InputConfig {
-    pub yaw: AxisBinding,
-    pub throttle: AxisBinding,
-    pub roll: AxisBinding,
-    pub pitch: AxisBinding,
-    pub switch: SwitchBinding,
-}
-
-impl Default for InputConfig {
-    fn default() -> Self {
-        Self {
-            yaw: AxisBinding {
-                pad: "Keyboard".into(),
-                neg: Some("Q".into()),
-                pos: Some("E".into()),
-                raw: [-1.0, 1.0],
-                out: [-1.0, 1.0],
-                deadzone: 0.0,
-                ..Default::default()
-            },
-            throttle: AxisBinding {
-                pad: "Keyboard".into(),
-                pos: Some("LeftShift".into()),
-                raw: [0.0, 1.0],
-                out: [0.0, 1.0],
-                deadzone: 0.0,
-                ..Default::default()
-            },
-            roll: AxisBinding {
-                pad: "Keyboard".into(),
-                neg: Some("A".into()),
-                pos: Some("D".into()),
-                raw: [-1.0, 1.0],
-                out: [-1.0, 1.0],
-                deadzone: 0.0,
-                ..Default::default()
-            },
-            pitch: AxisBinding {
-                pad: "Keyboard".into(),
-                neg: Some("S".into()),
-                pos: Some("W".into()),
-                raw: [-1.0, 1.0],
-                out: [-1.0, 1.0],
-                deadzone: 0.0,
-                ..Default::default()
-            },
-            switch: SwitchBinding {
-                pad: "Keyboard".into(),
-                button: Some("Space".into()),
-                ..Default::default()
-            },
-        }
-    }
-}
-
-impl InputConfig {
-    pub fn load_or_default(path: &str) -> (Self, String) {
-        match std::fs::read_to_string(path) {
-            Ok(txt) => match serde_json::from_str(&txt) {
-                Ok(cfg) => (cfg, format!("{path}: loaded")),
-                Err(e) => (Self::default(), format!("{path}: parse error ({e})")),
-            },
-            Err(_) => (
-                Self::default(),
-                format!("{path}: not found (default keyboard)"),
-            ),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct DeviceState {
-    pub name: String,
-    pub connected: bool,
-    pub axes: BTreeMap<String, f32>,
-    pub buttons: BTreeMap<String, bool>,
-}
+pub use pads::DeviceState;
 
 pub struct GameInputs {
     pub yaw: f32,
@@ -143,20 +19,9 @@ pub struct GameInputs {
     pub switch: bool,
 }
 
-struct PadEntry {
-    instance_id: u32,
-    _joystick: Joystick,
-    state: DeviceState,
-}
-
-#[derive(Default)]
-struct SharedPads {
-    version: u64,
-    pads: Vec<DeviceState>,
-}
-
 pub struct InputSystem {
     shared: Arc<Mutex<SharedPads>>,
+    defaults: InputConfig,
     last_version: u64,
     pub keyboard: DeviceState,
     pads_snapshot: Vec<DeviceState>,
@@ -171,11 +36,12 @@ impl InputSystem {
         let shared = Arc::new(Mutex::new(SharedPads::default()));
         let shared_bg = Arc::clone(&shared);
 
-        thread::spawn(move || Self::joystick_thread(shared_bg));
+        thread::spawn(move || run_joystick_thread(shared_bg));
 
         let (cfg, status) = InputConfig::load_or_default(config_path);
         Self {
             shared,
+            defaults: InputConfig::default(),
             last_version: 0,
             keyboard: DeviceState {
                 name: "Keyboard".into(),
@@ -188,178 +54,6 @@ impl InputSystem {
             config_path: config_path.to_string(),
             status,
             selected: 0,
-        }
-    }
-
-    fn joystick_thread(shared: Arc<Mutex<SharedPads>>) {
-        sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
-        sdl2::hint::set("SDL_JOYSTICK_THREAD", "1");
-        sdl2::hint::set("SDL_JOYSTICK_WGI", "0");
-
-        let sdl = sdl2::init().expect("sdl2 init failed");
-        let joystick_sub = sdl.joystick().expect("sdl2 joystick init failed");
-        let mut event_pump = sdl.event_pump().expect("sdl2 event_pump failed");
-
-        let mut local_pads = Vec::new();
-        match joystick_sub.num_joysticks() {
-            Ok(count) => {
-                for idx in 0..count {
-                    match joystick_sub.open(idx) {
-                        Ok(joy) => local_pads.push(Self::make_pad_entry(joy)),
-                        Err(e) => eprintln!("sdl2 joystick open({idx}) failed: {e}"),
-                    }
-                }
-            }
-            Err(e) => eprintln!("sdl2 num_joysticks failed: {e}"),
-        }
-
-        if let Ok(mut guard) = shared.lock() {
-            guard.pads = local_pads.iter().map(|p| p.state.clone()).collect();
-            guard.version = guard.version.wrapping_add(1);
-        }
-
-        loop {
-            if let Some(first) = event_pump.wait_event_timeout(4) {
-                let mut changed = Self::handle_event(first, &joystick_sub, &mut local_pads);
-                while let Some(ev) = event_pump.poll_event() {
-                    if Self::handle_event(ev, &joystick_sub, &mut local_pads) {
-                        changed = true;
-                    }
-                }
-                if changed {
-                    if let Ok(mut guard) = shared.lock() {
-                        guard.pads = local_pads.iter().map(|p| p.state.clone()).collect();
-                        guard.version = guard.version.wrapping_add(1);
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_event(
-        event: Event,
-        joystick_sub: &JoystickSubsystem,
-        pads: &mut Vec<PadEntry>,
-    ) -> bool {
-        match event {
-            Event::JoyDeviceAdded { which, .. } => match joystick_sub.open(which) {
-                Ok(joy) => {
-                    let id = joy.instance_id();
-                    let entry = Self::make_pad_entry(joy);
-                    if let Some(existing) = pads.iter_mut().find(|p| p.instance_id == id) {
-                        *existing = entry;
-                    } else {
-                        pads.push(entry);
-                    }
-                    true
-                }
-                Err(e) => {
-                    eprintln!("sdl2 joystick hotplug open({which}) failed: {e}");
-                    false
-                }
-            },
-            Event::JoyDeviceRemoved { which, .. } => {
-                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
-                    p.state.connected = false;
-                    true
-                } else {
-                    false
-                }
-            }
-            Event::JoyAxisMotion {
-                which,
-                axis_idx,
-                value,
-                ..
-            } => {
-                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
-                    p.state
-                        .axes
-                        .insert(format!("Axis{axis_idx}"), Self::norm_axis(value));
-                    true
-                } else {
-                    false
-                }
-            }
-            Event::JoyButtonDown {
-                which, button_idx, ..
-            } => {
-                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
-                    p.state.buttons.insert(format!("Button{button_idx}"), true);
-                    true
-                } else {
-                    false
-                }
-            }
-            Event::JoyButtonUp {
-                which, button_idx, ..
-            } => {
-                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
-                    p.state.buttons.insert(format!("Button{button_idx}"), false);
-                    true
-                } else {
-                    false
-                }
-            }
-            Event::JoyHatMotion {
-                which,
-                hat_idx,
-                state,
-                ..
-            } => {
-                if let Some(p) = pads.iter_mut().find(|p| p.instance_id == which) {
-                    let (hx, hy) = match state {
-                        HatState::Centered => (0.0, 0.0),
-                        HatState::Up => (0.0, 1.0),
-                        HatState::Down => (0.0, -1.0),
-                        HatState::Left => (-1.0, 0.0),
-                        HatState::Right => (1.0, 0.0),
-                        HatState::LeftUp => (-1.0, 1.0),
-                        HatState::LeftDown => (-1.0, -1.0),
-                        HatState::RightUp => (1.0, 1.0),
-                        HatState::RightDown => (1.0, -1.0),
-                    };
-                    p.state.axes.insert(format!("Hat{hat_idx}X"), hx);
-                    p.state.axes.insert(format!("Hat{hat_idx}Y"), hy);
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
-    }
-
-    fn make_pad_entry(joy: Joystick) -> PadEntry {
-        let mut axes = BTreeMap::new();
-        for a in 0..joy.num_axes() {
-            if let Ok(val) = joy.axis(a) {
-                axes.insert(format!("Axis{a}"), Self::norm_axis(val));
-            }
-        }
-        let mut buttons = BTreeMap::new();
-        for b in 0..joy.num_buttons() {
-            if let Ok(pressed) = joy.button(b) {
-                buttons.insert(format!("Button{b}"), pressed);
-            }
-        }
-        PadEntry {
-            instance_id: joy.instance_id(),
-            state: DeviceState {
-                name: joy.name(),
-                connected: joy.attached(),
-                axes,
-                buttons,
-            },
-            _joystick: joy,
-        }
-    }
-
-    fn norm_axis(v: i16) -> f32 {
-        if v < 0 {
-            v as f32 / 32768.0
-        } else {
-            v as f32 / 32767.0
         }
     }
 
@@ -388,7 +82,7 @@ impl InputSystem {
             }
         }
 
-        let def = InputConfig::default();
+        let def = &self.defaults;
         GameInputs {
             yaw: self.eval_axis(&self.cfg.yaw, &def.yaw, false),
             throttle: self.eval_axis(&self.cfg.throttle, &def.throttle, true),

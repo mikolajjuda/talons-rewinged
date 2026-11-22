@@ -1,0 +1,45 @@
+{
+  "yaw": {
+    "pad": "Keyboard",
+    "axis": null,
+    "neg": "Q",
+    "pos": "E",
+    "raw": [-1.0, 1.0],
+    "out": [-1.0, 1.0],
+    "deadzone": 0.0
+  },
+  "throttle": {
+    "pad": "Keyboard",
+    "axis": null,
+    "neg": null,
+    "pos": "LeftShift",
+    "raw": [0.0, 1.0],
+    "out": [0.0, 1.0],
+    "deadzone": 0.0
+  },
+  "roll": {
+    "pad": "Keyboard",
+    "axis": null,
+    "neg": "A",
+    "pos": "D",
+    "raw": [-1.0, 1.0],
+    "out": [-1.0, 1.0],
+    "deadzone": 0.0
+  },
+  "pitch": {
+    "pad": "Keyboard",
+    "axis": null,
+    "neg": "S",
+    "pos": "W",
+    "raw": [-1.0, 1.0],
+    "out": [-1.0, 1.0],
+    "deadzone": 0.0
+  },
+  "switch": {
+    "pad": "Keyboard",
+    "button": "Space",
+    "axis": null,
+    "threshold": 0.25,
+    "invert": false
+  }
+}
